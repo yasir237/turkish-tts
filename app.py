@@ -4,6 +4,7 @@ import re
 
 import edge_tts
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -21,6 +22,15 @@ VOLUME_RE = re.compile(r"^[+-]\d{1,3}%$")
 PITCH_RE = re.compile(r"^[+-]\d{1,3}Hz$")
 
 app = FastAPI(title="Türkçe TTS API")
+
+# Tarayıcıdaki araçların (başka bir adresten) bu API'yi çağırabilmesi için.
+# allow_headers=["*"] -> x-api-key başlığına izin verir (preflight isteği için şart).
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class TTSRequest(BaseModel):
