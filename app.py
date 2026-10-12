@@ -1,12 +1,18 @@
+import asyncio
 import io
+import logging
 import os
 import re
+import traceback
+from collections import OrderedDict
 
 import edge_tts
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
+
+log = logging.getLogger("uvicorn.error")
 
 # Sadece Türkçe sesler
 VOICES = {
@@ -16,15 +22,20 @@ VOICES = {
 
 API_KEY = os.environ.get("API_KEY")  # boşsa anahtar kontrolü yapılmaz
 MAX_CHARS = 3000
+RETRIES = 3
+CACHE_MAX = 500
 
 RATE_RE = re.compile(r"^[+-]\d{1,3}%$")
 VOLUME_RE = re.compile(r"^[+-]\d{1,3}%$")
 PITCH_RE = re.compile(r"^[+-]\d{1,3}Hz$")
 
+# Microsoft'a aynı anda en fazla 2 istek
+SEM = asyncio.Semaphore(2)
+# (voice, text, rate, volume, pitch) -> mp3 baytları
+CACHE: "OrderedDict[tuple, bytes]" = OrderedDict()
+
 app = FastAPI(title="Türkçe TTS API")
 
-# Tarayıcıdaki araçların (başka bir adresten) bu API'yi çağırabilmesi için.
-# allow_headers=["*"] -> x-api-key başlığına izin verir (preflight isteği için şart).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -59,20 +70,39 @@ async def synthesize(req: TTSRequest) -> bytes:
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="text boş olamaz")
 
-    buf = io.BytesIO()
-    try:
-        comm = edge_tts.Communicate(
-            req.text, voice, rate=req.rate, volume=req.volume, pitch=req.pitch
-        )
-        async for chunk in comm.stream():
-            if chunk["type"] == "audio":
-                buf.write(chunk["data"])
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Ses servisi hatası: {e}")
-    data = buf.getvalue()
-    if not data:
-        raise HTTPException(status_code=502, detail="Ses servisi boş yanıt döndürdü")
-    return data
+    key = (voice, req.text, req.rate, req.volume, req.pitch)
+    if key in CACHE:
+        CACHE.move_to_end(key)
+        return CACHE[key]
+
+    last = None
+    async with SEM:
+        for attempt in range(RETRIES):
+            buf = io.BytesIO()
+            try:
+                comm = edge_tts.Communicate(
+                    req.text, voice, rate=req.rate, volume=req.volume, pitch=req.pitch
+                )
+                async for chunk in comm.stream():
+                    if chunk["type"] == "audio":
+                        buf.write(chunk["data"])
+                data = buf.getvalue()
+                if data:
+                    CACHE[key] = data
+                    while len(CACHE) > CACHE_MAX:
+                        CACHE.popitem(last=False)
+                    return data
+                last = "boş yanıt"
+                log.warning("edge-tts boş yanıt (deneme %d/%d)", attempt + 1, RETRIES)
+            except Exception as e:
+                last = repr(e)
+                log.error(
+                    "edge-tts hatası (deneme %d/%d): %r\n%s",
+                    attempt + 1, RETRIES, e, traceback.format_exc(),
+                )
+            await asyncio.sleep(1.5 * (attempt + 1))
+
+    raise HTTPException(status_code=502, detail=f"Ses servisi hatası: {last}")
 
 
 @app.get("/health")
@@ -83,6 +113,21 @@ def health():
 @app.get("/voices")
 def voices():
     return {k: v for k, v in VOICES.items()}
+
+
+@app.get("/selftest")
+async def selftest(x_api_key: str = Header(default=None)):
+    """edge-tts çalışıyor mu? Başarısızsa asıl hatayı döndürür."""
+    check_key(x_api_key)
+    try:
+        comm = edge_tts.Communicate("Merhaba", VOICES["emel"])
+        n = 0
+        async for chunk in comm.stream():
+            if chunk["type"] == "audio":
+                n += len(chunk["data"])
+        return {"ok": n > 0, "audio_bytes": n, "edge_tts": getattr(edge_tts, "__version__", "?")}
+    except Exception as e:
+        return {"ok": False, "error": repr(e), "trace": traceback.format_exc()}
 
 
 @app.get("/tts")
